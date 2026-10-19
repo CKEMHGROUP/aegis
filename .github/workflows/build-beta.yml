@@ -1,1 +1,119 @@
+# Builds the Aegis beta app on a GitHub Mac, so nothing big is installed on your own Mac.
+# Run it from the repository's "Actions" tab: Build beta > Run workflow.
+name: Build beta
+
+on:
+  workflow_dispatch:
+    inputs:
+      expires:
+        description: "Last valid day of the beta (YYYY-MM-DD)"
+        required: true
+        type: string
+      testers:
+        description: "How many personal keys to create"
+        default: "5"
+        type: string
+      contact:
+        description: "Contact shown to testers when the beta has expired (optional)"
+        default: ""
+        type: string
+      names:
+        description: "Tester names, comma separated, to label the keys (optional)"
+        default: ""
+        type: string
+      no_key:
+        description: "Expiry only, no personal keys"
+        type: boolean
+        default: false
+      models:
+        description: "Language models: md = smaller app (recommended for beta), lg = more accurate but very large"
+        type: choice
+        options: [md, lg]
+        default: md
+      arch:
+        description: "intel = Intel Macs (also runs on Apple Silicon via Rosetta), arm = Apple Silicon only"
+        type: choice
+        options: [intel, arm]
+        default: intel
+
+jobs:
+  build:
+    runs-on: ${{ inputs.arch == 'arm' && 'macos-15' || 'macos-15-intel' }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        env:
+          MODELS: ${{ inputs.models }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          python -m spacy download "en_core_web_${MODELS}"
+          python -m spacy download "pt_core_news_${MODELS}"
+          if [ "$MODELS" = "md" ]; then
+            python -m spacy download "es_core_news_md"
+            python -m spacy download "de_core_news_md"
+          fi
+
+      - name: Quick tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests/test_core.py tests/test_v12.py tests/test_v13.py tests/test_robustness.py tests/test_beta.py
+
+      - name: Create the beta gate (expiry date and personal keys)
+        env:
+          EXPIRES: ${{ inputs.expires }}
+          TESTERS: ${{ inputs.testers }}
+          CONTACT: ${{ inputs.contact }}
+          NAMES: ${{ inputs.names }}
+          NO_KEY: ${{ inputs.no_key }}
+        run: |
+          args=(--expires "$EXPIRES" --testers "$TESTERS" --keys-out "$RUNNER_TEMP/keys.csv")
+          if [ -n "$CONTACT" ]; then args+=(--contact "$CONTACT"); fi
+          if [ -n "$NAMES" ]; then args+=(--names "$NAMES"); fi
+          if [ "$NO_KEY" = "true" ]; then args+=(--no-key); fi
+          python tools/make_beta_config.py "${args[@]}"
+
+      - name: Build the app
+        run: pyinstaller --noconfirm Aegis_Privacy_Airlock.spec
+
+      - name: Sign (ad hoc, so the app can start on any Mac)
+        run: codesign --force --deep --sign - "dist/Aegis Privacy Airlock.app"
+
+      - name: Start-up check (the app must reach the beta key prompt without crashing)
+        run: |
+          set +e
+          QT_QPA_PLATFORM=offscreen timeout 30 "dist/Aegis Privacy Airlock.app/Contents/MacOS/Aegis Privacy Airlock" > "$RUNNER_TEMP/launch.log" 2>&1
+          code=$?
+          echo "exit code: $code (124 = still running when stopped, which is good)"
+          tail -n 30 "$RUNNER_TEMP/launch.log"
+          if [ "$code" != "124" ] && [ "$code" != "0" ]; then echo "The app crashed at start-up."; exit 1; fi
+
+      - name: Package
+        env:
+          ZIPNAME: Aegis-Beta-${{ inputs.expires }}-${{ inputs.arch }}.zip
+        run: ditto -c -k --keepParent "dist/Aegis Privacy Airlock.app" "$ZIPNAME"
+
+      - name: Upload the beta app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aegis-Beta-${{ inputs.expires }}-${{ inputs.arch }}
+          path: Aegis-Beta-*.zip
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload the personal keys (download within a day, then delete)
+        if: ${{ !inputs.no_key }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: tester-keys-PRIVATE
+          path: ${{ runner.temp }}/keys.csv
+          retention-days: 1
 
